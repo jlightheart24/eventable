@@ -8,15 +8,25 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
 const (
-	graphBase    = "https://graph.facebook.com/v19.0"
-	eventFields  = "id,name,start_time,end_time,place,description,cover"
-	timeFormat   = "2006-01-02T15:04:05-0700"
+	graphBase     = "https://graph.facebook.com/v19.0"
+	eventFields   = "id,name,start_time,end_time,place,description"
+	timeFormat    = "2006-01-02T15:04:05-0700"
 	displayFormat = "Mon, Jan 2 2006 at 3:04 PM"
+	batchSize     = 50
 )
+
+// PageInfo associates a Facebook Page ID with its display name.
+// Use this when the name has already been resolved (e.g. from the store)
+// so FetchAllBatch does not need an extra API call per page.
+type PageInfo struct {
+	ID   string
+	Name string
+}
 
 // Event represents a single Facebook calendar event.
 type Event struct {
@@ -31,7 +41,8 @@ type Event struct {
 	Link        string
 }
 
-// graphEvent is the raw JSON shape returned by the Graph API.
+// --- JSON shapes -------------------------------------------------------
+
 type graphEvent struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
@@ -50,51 +61,112 @@ type eventsResponse struct {
 	} `json:"paging"`
 }
 
-type pageResponse struct {
-	Name string `json:"name"`
+type pageNameResponse struct {
+	Name  string `json:"name"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
-// parseTime attempts to parse a Facebook timestamp string, which may or may
-// not include a time component.
+type batchRequest struct {
+	Method      string `json:"method"`
+	RelativeURL string `json:"relative_url"`
+}
+
+type batchResponseItem struct {
+	Code int    `json:"code"`
+	Body string `json:"body"`
+}
+
+// --- Helpers -----------------------------------------------------------
+
 func parseTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
 	}
-	// Try full datetime first.
 	if t, err := time.Parse(timeFormat, s); err == nil {
 		return t
 	}
-	// Fall back to date-only.
 	if t, err := time.Parse("2006-01-02", s); err == nil {
 		return t
 	}
 	return time.Time{}
 }
 
-// pageName resolves a Facebook Page ID to its display name.
-func pageName(pageID, accessToken string) string {
-	u := fmt.Sprintf("%s/%s?fields=name&access_token=%s", graphBase, pageID, url.QueryEscape(accessToken))
+func toEvent(ge graphEvent, pageID, pageName string) Event {
+	e := Event{
+		ID:          ge.ID,
+		PageID:      pageID,
+		PageName:    pageName,
+		Title:       ge.Name,
+		StartTime:   parseTime(ge.StartTime),
+		EndTime:     parseTime(ge.EndTime),
+		Description: ge.Description,
+		Link:        fmt.Sprintf("https://www.facebook.com/events/%s", ge.ID),
+	}
+	if ge.Place != nil {
+		e.Location = ge.Place.Name
+	}
+	return e
+}
+
+// FormatTime returns a human-readable representation of an event time.
+func FormatTime(t time.Time) string {
+	if t.IsZero() {
+		return "TBD"
+	}
+	return t.Format(displayFormat)
+}
+
+// --- Name resolution ---------------------------------------------------
+
+// ResolveName looks up the display name of a Facebook Page by its ID or
+// username, validating that it exists and is accessible with the given token.
+func ResolveName(pageID, accessToken string) (string, error) {
+	u := fmt.Sprintf("%s/%s?fields=name&access_token=%s",
+		graphBase, pageID, url.QueryEscape(accessToken))
+
 	resp, err := http.Get(u) //nolint:noctx
 	if err != nil {
-		return pageID
+		return "", fmt.Errorf("contacting Graph API: %w", err)
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	var pr pageResponse
-	if err := json.Unmarshal(body, &pr); err != nil || pr.Name == "" {
-		return pageID
+
+	var pr pageNameResponse
+	if err := json.Unmarshal(body, &pr); err != nil {
+		return "", fmt.Errorf("decoding page response: %w", err)
 	}
-	return pr.Name
+	if pr.Error != nil {
+		return "", fmt.Errorf("Graph API: %s", pr.Error.Message)
+	}
+	if pr.Name == "" {
+		return "", fmt.Errorf("page %q not found", pageID)
+	}
+	return pr.Name, nil
 }
 
-// FetchPage retrieves all upcoming events for a single Facebook Page.
-// It follows pagination cursors until all events have been collected.
-func FetchPage(pageID, accessToken string) ([]Event, error) {
-	name := pageName(pageID, accessToken)
+// resolveName is the internal version that falls back to pageID on error.
+func resolveName(pageID, accessToken string) string {
+	name, err := ResolveName(pageID, accessToken)
+	if err != nil {
+		return pageID
+	}
+	return name
+}
 
+// --- Single-page fetch (used internally and for one-off checks) --------
+
+// FetchPage retrieves all upcoming events for a single Facebook Page.
+func FetchPage(pageID, accessToken string) ([]Event, error) {
+	name := resolveName(pageID, accessToken)
+	return fetchPageWithName(pageID, name, accessToken)
+}
+
+func fetchPageWithName(pageID, name, accessToken string) ([]Event, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
-	startURL := fmt.Sprintf(
-		"%s/%s/events?fields=%s&since=%s&access_token=%s",
+	nextURL := fmt.Sprintf(
+		"%s/%s/events?fields=%s&since=%s&limit=100&access_token=%s",
 		graphBase,
 		pageID,
 		url.QueryEscape(eventFields),
@@ -103,8 +175,6 @@ func FetchPage(pageID, accessToken string) ([]Event, error) {
 	)
 
 	var events []Event
-	nextURL := startURL
-
 	for nextURL != "" {
 		resp, err := http.Get(nextURL) //nolint:noctx
 		if err != nil {
@@ -114,29 +184,15 @@ func FetchPage(pageID, accessToken string) ([]Event, error) {
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("graph API returned %d for page %s: %s", resp.StatusCode, pageID, body)
+			return nil, fmt.Errorf("graph API %d for page %s: %s", resp.StatusCode, pageID, body)
 		}
 
 		var er eventsResponse
 		if err := json.Unmarshal(body, &er); err != nil {
 			return nil, fmt.Errorf("decoding events for page %s: %w", pageID, err)
 		}
-
 		for _, ge := range er.Data {
-			e := Event{
-				ID:          ge.ID,
-				PageID:      pageID,
-				PageName:    name,
-				Title:       ge.Name,
-				StartTime:   parseTime(ge.StartTime),
-				EndTime:     parseTime(ge.EndTime),
-				Description: ge.Description,
-				Link:        fmt.Sprintf("https://www.facebook.com/events/%s", ge.ID),
-			}
-			if ge.Place != nil {
-				e.Location = ge.Place.Name
-			}
-			events = append(events, e)
+			events = append(events, toEvent(ge, pageID, name))
 		}
 
 		nextURL = ""
@@ -144,40 +200,105 @@ func FetchPage(pageID, accessToken string) ([]Event, error) {
 			nextURL = er.Paging.Next
 		}
 	}
-
 	return events, nil
 }
 
-// FetchAll retrieves upcoming events from all provided Facebook Page IDs.
-// Errors for individual pages are collected and returned together; successfully
-// fetched pages are still included in the result.
+// FetchAll fetches events sequentially. For large numbers of pages prefer
+// FetchAllBatch, which is far more efficient.
 func FetchAll(pageIDs []string, accessToken string) ([]Event, error) {
-	var (
-		all    []Event
-		errs   []error
-	)
+	var all []Event
+	var errs []string
 	for _, id := range pageIDs {
 		events, err := FetchPage(id, accessToken)
 		if err != nil {
-			errs = append(errs, err)
+			errs = append(errs, err.Error())
 			continue
 		}
 		all = append(all, events...)
 	}
 	if len(errs) > 0 {
-		msgs := ""
-		for _, e := range errs {
-			msgs += e.Error() + "; "
-		}
-		return all, fmt.Errorf("errors fetching pages: %s", msgs)
+		return all, fmt.Errorf("errors fetching pages: %s", strings.Join(errs, "; "))
 	}
 	return all, nil
 }
 
-// FormatTime returns a human-readable representation of a parsed event time.
-func FormatTime(t time.Time) string {
-	if t.IsZero() {
-		return "TBD"
+// --- Batch fetch -------------------------------------------------------
+
+// FetchAllBatch retrieves upcoming events for all pages using the Graph API
+// batch endpoint (up to 50 sub-requests per HTTP call). Page names are read
+// from PageInfo so no extra API call per page is needed.
+func FetchAllBatch(pages []PageInfo, accessToken string) ([]Event, error) {
+	if len(pages) == 0 {
+		return nil, nil
 	}
-	return t.Format(displayFormat)
+
+	now := url.QueryEscape(time.Now().UTC().Format(time.RFC3339))
+	fields := url.QueryEscape(eventFields)
+
+	var all []Event
+	var errs []string
+
+	for i := 0; i < len(pages); i += batchSize {
+		end := i + batchSize
+		if end > len(pages) {
+			end = len(pages)
+		}
+		chunk := pages[i:end]
+
+		batch := make([]batchRequest, len(chunk))
+		for j, p := range chunk {
+			batch[j] = batchRequest{
+				Method:      "GET",
+				RelativeURL: fmt.Sprintf("%s/events?fields=%s&since=%s&limit=100", p.ID, fields, now),
+			}
+		}
+
+		batchJSON, err := json.Marshal(batch)
+		if err != nil {
+			return all, fmt.Errorf("marshalling batch: %w", err)
+		}
+
+		form := url.Values{}
+		form.Set("access_token", accessToken)
+		form.Set("include_headers", "false")
+		form.Set("batch", string(batchJSON))
+
+		resp, err := http.PostForm(graphBase, form)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("batch POST failed: %v", err))
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var items []batchResponseItem
+		if err := json.Unmarshal(body, &items); err != nil {
+			errs = append(errs, fmt.Sprintf("decoding batch response: %v", err))
+			continue
+		}
+
+		for j, item := range items {
+			if j >= len(chunk) {
+				break
+			}
+			page := chunk[j]
+			if item.Code != http.StatusOK {
+				errs = append(errs, fmt.Sprintf("page %s returned HTTP %d", page.ID, item.Code))
+				continue
+			}
+			var er eventsResponse
+			if err := json.Unmarshal([]byte(item.Body), &er); err != nil {
+				errs = append(errs, fmt.Sprintf("decoding events for page %s: %v", page.ID, err))
+				continue
+			}
+			for _, ge := range er.Data {
+				all = append(all, toEvent(ge, page.ID, page.Name))
+			}
+		}
+	}
+
+	if len(errs) > 0 {
+		return all, fmt.Errorf("batch errors: %s", strings.Join(errs, "; "))
+	}
+	return all, nil
 }

@@ -1,87 +1,123 @@
 // Command monitor polls configured Facebook Pages every 15 minutes and sends
-// a Gmail notification for any newly discovered events.
+// a Gmail notification for any newly discovered events. A web UI on :8080
+// (or $WEB_PORT) lets you add and remove monitored pages at runtime.
 package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/jlightheart24/eventable/event"
 	"github.com/jlightheart24/eventable/notifier"
+	"github.com/jlightheart24/eventable/store"
+	"github.com/jlightheart24/eventable/web"
 )
 
 const (
-	pollInterval  = 15 * time.Minute
+	pollInterval   = 15 * time.Minute
 	seenEventsFile = "seen_events.json"
 )
 
 func main() {
-	cfg := loadConfig()
+	accessToken := mustEnv("FB_ACCESS_TOKEN")
+	notifyCfg := notifier.Config{
+		GmailUser:     mustEnv("GMAIL_USER"),
+		GmailPassword: mustEnv("GMAIL_APP_PASSWORD"),
+		NotifyEmail:   mustEnv("NOTIFY_EMAIL"),
+	}
+	webPort := envOr("WEB_PORT", "8080")
 
-	log.Printf("Eventable monitor starting — watching %d page(s), polling every %s",
-		len(cfg.pageIDs), pollInterval)
+	pageStore, err := store.New(store.DefaultPath)
+	if err != nil {
+		log.Fatalf("loading page store: %v", err)
+	}
+
+	status := &web.Status{}
+	srv := web.New(pageStore, accessToken, status)
+
+	go func() {
+		addr := ":" + webPort
+		log.Printf("Web UI → http://localhost%s", addr)
+		if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
+			log.Fatalf("web server: %v", err)
+		}
+	}()
 
 	seen := loadSeen()
+	log.Printf("Eventable monitor starting — polling every %s", pollInterval)
 
-	// Run immediately on startup, then on each tick.
-	runOnce(cfg, seen)
+	// Run immediately, then on each tick.
+	runOnce(accessToken, notifyCfg, pageStore, seen, status)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		runOnce(cfg, seen)
+		runOnce(accessToken, notifyCfg, pageStore, seen, status)
 	}
 }
 
-// appConfig holds all runtime configuration.
-type appConfig struct {
-	accessToken string
-	pageIDs     []string
-	notifier    notifier.Config
-}
+// runOnce performs a single poll cycle.
+func runOnce(
+	accessToken string,
+	notifyCfg notifier.Config,
+	pageStore *store.Store,
+	seen seenSet,
+	status *web.Status,
+) {
+	pages := pageStore.List()
+	if len(pages) == 0 {
+		log.Println("No pages configured — add some via the web UI")
+		status.Set(time.Now(), 0)
+		fmt.Printf("Next check at %s\n", time.Now().Add(pollInterval).Format("15:04:05"))
+		return
+	}
 
-func loadConfig() appConfig {
-	get := func(key string) string {
-		v := os.Getenv(key)
-		if v == "" {
-			log.Fatalf("required environment variable %s is not set", key)
+	log.Printf("Polling %d page(s) via batch API...", len(pages))
+
+	pageInfos := make([]event.PageInfo, len(pages))
+	for i, p := range pages {
+		pageInfos[i] = event.PageInfo{ID: p.ID, Name: p.Name}
+	}
+
+	events, err := event.FetchAllBatch(pageInfos, accessToken)
+	if err != nil {
+		log.Printf("warn: %v", err)
+	}
+
+	var newEvents []event.Event
+	for _, e := range events {
+		if _, ok := seen[e.ID]; !ok {
+			newEvents = append(newEvents, e)
+			seen[e.ID] = struct{}{}
 		}
-		return v
 	}
 
-	rawIDs := get("FB_PAGE_IDS")
-	var ids []string
-	for _, id := range strings.Split(rawIDs, ",") {
-		if id = strings.TrimSpace(id); id != "" {
-			ids = append(ids, id)
+	log.Printf("Found %d total event(s), %d new", len(events), len(newEvents))
+	status.Set(time.Now(), len(newEvents))
+
+	if len(newEvents) > 0 {
+		if err := notifier.Send(notifyCfg, newEvents); err != nil {
+			log.Printf("error sending notification: %v", err)
+		} else {
+			log.Printf("Notification sent for %d new event(s)", len(newEvents))
 		}
-	}
-	if len(ids) == 0 {
-		log.Fatal("FB_PAGE_IDS must contain at least one page ID")
+		saveSeen(seen)
 	}
 
-	return appConfig{
-		accessToken: get("FB_ACCESS_TOKEN"),
-		pageIDs:     ids,
-		notifier: notifier.Config{
-			GmailUser:     get("GMAIL_USER"),
-			GmailPassword: get("GMAIL_APP_PASSWORD"),
-			NotifyEmail:   get("NOTIFY_EMAIL"),
-		},
-	}
+	fmt.Printf("Next check at %s\n", time.Now().Add(pollInterval).Format("15:04:05"))
 }
 
-// seenSet maps event IDs to struct{} for O(1) lookup.
+// --- Seen-events persistence -------------------------------------------
+
 type seenSet map[string]struct{}
 
 func loadSeen() seenSet {
 	data, err := os.ReadFile(seenEventsFile)
 	if err != nil {
-		// File not found on first run — start fresh.
 		return make(seenSet)
 	}
 	var ids []string
@@ -111,33 +147,19 @@ func saveSeen(seen seenSet) {
 	}
 }
 
-func runOnce(cfg appConfig, seen seenSet) {
-	log.Println("Fetching events...")
+// --- Env helpers -------------------------------------------------------
 
-	events, err := event.FetchAll(cfg.pageIDs, cfg.accessToken)
-	if err != nil {
-		// FetchAll returns partial results alongside errors.
-		log.Printf("warn: %v", err)
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("required environment variable %s is not set", key)
 	}
+	return v
+}
 
-	var newEvents []event.Event
-	for _, e := range events {
-		if _, ok := seen[e.ID]; !ok {
-			newEvents = append(newEvents, e)
-			seen[e.ID] = struct{}{}
-		}
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-
-	log.Printf("Found %d total event(s), %d new", len(events), len(newEvents))
-
-	if len(newEvents) > 0 {
-		if err := notifier.Send(cfg.notifier, newEvents); err != nil {
-			log.Printf("error sending notification: %v", err)
-		} else {
-			log.Printf("Notification sent for %d new event(s)", len(newEvents))
-		}
-		saveSeen(seen)
-	}
-
-	fmt.Printf("Next check at %s\n", time.Now().Add(pollInterval).Format("15:04:05"))
+	return def
 }
