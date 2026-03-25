@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jlightheart24/eventable/event"
+	"github.com/jlightheart24/eventable/internal/dotenv"
 	"github.com/jlightheart24/eventable/notifier"
 	"github.com/jlightheart24/eventable/store"
 	"github.com/jlightheart24/eventable/web"
@@ -23,6 +24,10 @@ const (
 )
 
 func main() {
+	if err := dotenv.Load(".env"); err != nil {
+		log.Printf("warn: could not read .env: %v", err)
+	}
+
 	accessToken := mustEnv("FB_ACCESS_TOKEN")
 	notifyCfg := notifier.Config{
 		GmailUser:     mustEnv("GMAIL_USER"),
